@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python2 -B
 # -*- coding: utf-8 -*-
 import env
 import time
