@@ -1,4 +1,11 @@
 <%inherit file="/main.mako" />
+<h1>Forside</h1>
+
+%if visitcount == 1:
+    <h3>Du har set denne side ${escape(str(visitcount))} gang.</h3>
+%else:
+    <h3>Du har set denne side ${escape(str(visitcount))} gange.</h3>
+%endif
 <p>
     Man kan fremad se, at de har været udset til at læse, at der skal dannes par
     af ligheder. Dermed kan der afsluttes uden løse ender, og de kan optimeres

@@ -2,7 +2,9 @@
 from app.utils.misc import template_response, local, db, urlfor, redirect
 
 def index():
-    template_response("/page/index.mako")
+    visitcount = local.session.get("visitcount", 0) + 1
+    local.session["visitcount"] = visitcount
+    template_response("/page/index.mako", visitcount=visitcount)
 
 def testpage0():
     template_response("/error/notyet.mako")
