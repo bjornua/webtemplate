@@ -7,7 +7,7 @@ from os.path import join
 from werkzeug import Request, Response, SharedDataMiddleware
 from werkzeug.exceptions import NotFound
 
-from app.mapping import url_map, endpoints
+from app.mapping import url_map, endpts
 from app.utils.misc import local, path
 from app.utils.session import Session
 
@@ -36,18 +36,21 @@ class Main(object):
         try:
             local.url_adapter = url_adapter = url_map.bind_to_environ(environ)
             try:
-                endpoint, params = url_adapter.match()
+                endpt, params = url_adapter.match()
             except NotFound:
-                endpoint = "notfound"
-                params = {}
-            local.endpoint = endpoint
-            endpoints[endpoint](**params)
+                endpt, params = "notfound", {}
+            local.endpt = endpt
+            endpts[endpt](**params)
         except:
             if self.debug:
                 raise
             else:
-                log.exception("Exception")
-                endpoints["error"]()
+                log.exception(
+                    "Exception in %s with params %s",
+                    endpt, repr(params)
+                )
+                local.endpt = "error"
+                endpts["error"]()
         response = local.response
         local.session.save()
         local.session.set_cookie(local.response)

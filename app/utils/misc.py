@@ -54,7 +54,7 @@ def template_render(templatename, **kwargs):
         "escattr": xml.sax.saxutils.quoteattr,
         "escape": xml.sax.saxutils.escape,
         "json": json.dumps,
-        "endpoint": local.endpoint,
+        "endpoint": local.endpt,
         "endpoint_override": None,
         "widget": app.widget
     })
