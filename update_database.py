@@ -18,3 +18,6 @@ def main():
             continue
         
         couchdbkit.designer.push(p, db())
+
+if __name__ == "__main__":
+    main()
