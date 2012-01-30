@@ -9,10 +9,12 @@ import werkzeug.utils
 import mako.lookup
 
 import couchdbkit
-
 import app.widget
 import app.config
 import pprint
+
+import restkit
+import socketpool
 
 config = app.config.get()
 
@@ -28,7 +30,8 @@ _db = None
 def db():
     global _db
     if _db is None:
-        server = couchdbkit.Server(config["couchdb_server_url"])
+        pool = socketpool.ConnectionPool(factory=restkit.Connection)
+        server = couchdbkit.Server(config["couchdb_server_url"], session=pool)
         _db = server.get_or_create_db(config["couchdb_db"])
     return _db
 
