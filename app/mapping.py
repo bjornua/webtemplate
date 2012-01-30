@@ -11,7 +11,6 @@ endpts = {
     "testpage1": app.controllers.index.testpage1,
     "testpage2": app.controllers.index.testpage2,
     "testpage3": app.controllers.index.testpage3,
-    "index": app.controllers.index.index,
 
 # System endpoints
     "notfound": app.controllers.error.notfound,
