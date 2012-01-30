@@ -1,9 +1,8 @@
 #!/usr/bin/python2 -B
 # -*- coding: utf-8 -*-
-
+import env
 import os.path
 import sys
-import grp
 import app.config
 from pprint import pprint
 
@@ -43,3 +42,6 @@ def write_config(config):
 def main():
     config = prompt_update_config()
     write_config(config)
+
+if __name__ == "__main__":
+    main()
