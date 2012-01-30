@@ -10,23 +10,23 @@ import re
 import urllib
 
 
-from restkit.util import to_bytestring, url_quote
+from restkit.util import to_bytestring, url_quote, url_encode
 
 MIME_BOUNDARY = 'END_OF_PART'
+CRLF = '\r\n'
 
-def form_encode(obj, charser="utf8"):
-    tmp = []
-    for key, value in obj.items():
-        tmp.append("%s=%s" % (url_quote(key), 
-                url_quote(value)))
-    return to_bytestring("&".join(tmp))
+def form_encode(obj, charset="utf8"):
+    encoded = url_encode(obj, charset=charset)
+    return to_bytestring(encoded)
 
 
 class BoundaryItem(object):
-    def __init__(self, name, value, fname=None, filetype=None, filesize=None):
-        self.name = url_quote(name)
+    def __init__(self, name, value, fname=None, filetype=None, filesize=None,
+                 quote=url_quote):
+        self.quote = quote
+        self.name = quote(name)
         if value is not None and not hasattr(value, 'read'):
-            value = url_quote(value)
+            value = self.encode_unreadable_value(value)
             self.size = len(value)
         self.value = value
         if fname is not None:
@@ -38,33 +38,39 @@ class BoundaryItem(object):
         if filetype is not None:
             filetype = to_bytestring(filetype)
         self.filetype = filetype
-        
+
         if isinstance(value, file) and filesize is None:
             try:
                 value.flush()
             except IOError:
                 pass
             self.size = int(os.fstat(value.fileno())[6])
-            
+
+        self._encoded_hdr = None
+        self._encoded_bdr = None
+
     def encode_hdr(self, boundary):
         """Returns the header of the encoding of this parameter"""
-        boundary = url_quote(boundary)
-        headers = ["--%s" % boundary]
-        if self.fname:
-            disposition = 'form-data; name="%s"; filename="%s"' % (self.name,
-                    self.fname)
-        else:
-            disposition = 'form-data; name="%s"' % self.name
-        headers.append("Content-Disposition: %s" % disposition)
-        if self.filetype:
-            filetype = self.filetype
-        else:
-            filetype = "text/plain; charset=utf-8"
-        headers.append("Content-Type: %s" % filetype)
-        headers.append("Content-Length: %i" % self.size)
-        headers.append("")
-        headers.append("")
-        return "\r\n".join(headers)
+        if not self._encoded_hdr or self._encoded_bdr != boundary:
+            boundary = self.quote(boundary)
+            self._encoded_bdr = boundary
+            headers = ["--%s" % boundary]
+            if self.fname:
+                disposition = 'form-data; name="%s"; filename="%s"' % (self.name,
+                        self.fname)
+            else:
+                disposition = 'form-data; name="%s"' % self.name
+            headers.append("Content-Disposition: %s" % disposition)
+            if self.filetype:
+                filetype = self.filetype
+            else:
+                filetype = "text/plain; charset=utf-8"
+            headers.append("Content-Type: %s" % filetype)
+            headers.append("Content-Length: %i" % self.size)
+            headers.append("")
+            headers.append("")
+            self._encoded_hdr = CRLF.join(headers)
+        return self._encoded_hdr
 
     def encode(self, boundary):
         """Returns the string encoding of this parameter"""
@@ -72,8 +78,8 @@ class BoundaryItem(object):
         if re.search("^--%s$" % re.escape(boundary), value, re.M):
             raise ValueError("boundary found in encoded string")
 
-        return "%s%s\r\n" % (self.encode_hdr(boundary), value)
-        
+        return "%s%s%s" % (self.encode_hdr(boundary), value, CRLF)
+
     def iter_encode(self, boundary, blocksize=16384):
         if not hasattr(self.value, "read"):
             yield self.encode(boundary)
@@ -82,23 +88,25 @@ class BoundaryItem(object):
             while True:
                 block = self.value.read(blocksize)
                 if not block:
-                    yield "\r\n"
-                    break
+                    yield CRLF
+                    return
                 yield block
-                
-                
+
+    def encode_unreadable_value(self, value):
+            return value
+
+
 class MultipartForm(object):
-    
-    def __init__(self, params, boundary, headers):
+    def __init__(self, params, boundary, headers, bitem_cls=BoundaryItem,
+                 quote=url_quote):
         self.boundary = boundary
+        self.tboundary = "--%s--%s" % (boundary, CRLF)
         self.boundaries = []
-        self.size = 0
-        
-        self.content_length = headers.get('Content-Length')
-        
+        self._clen = headers.get('Content-Length')
+
         if hasattr(params, 'items'):
             params = params.items()
-            
+
         for param in params:
             name, value = param
             if hasattr(value, "read"):
@@ -107,33 +115,55 @@ class MultipartForm(object):
                     filetype = ';'.join(filter(None, mimetypes.guess_type(fname)))
                 else:
                     filetype = None
-                if not isinstance(value, file) and self.content_length is None:
+                if not isinstance(value, file) and self._clen is None:
                     value = value.read()
-                    
-                boundary = BoundaryItem(name, value, fname, filetype)
-            else:
-                 boundary = BoundaryItem(name, value)
-            self.boundaries.append(boundary)
 
-    def get_size(self):
-        if self.content_length is not None:
-            return int(self.content_length)
-        size = 0
-        for boundary in self.boundaries:
-            size = size + boundary.size
-        return size
-        
+                boundary = bitem_cls(name, value, fname, filetype, quote=quote)
+                self.boundaries.append(boundary)
+            elif isinstance(value, list):
+                for v in value:
+                    boundary = bitem_cls(name, v, quote=quote)
+                    self.boundaries.append(boundary)
+            else:
+                boundary = bitem_cls(name, value, quote=quote)
+                self.boundaries.append(boundary)
+
+    def get_size(self, recalc=False):
+        if self._clen is None or recalc:
+            self._clen = 0
+            for boundary in self.boundaries:
+                self._clen += boundary.size
+                self._clen += len(boundary.encode_hdr(self.boundary))
+                self._clen += len(CRLF)
+            self._clen += len(self.tboundary)
+        return int(self._clen)
+
     def __iter__(self):
         for boundary in self.boundaries:
             for block in boundary.iter_encode(self.boundary):
                 yield block
-        yield "--%s--\r\n" % self.boundary
-                    
+        yield self.tboundary
 
-def multipart_form_encode(params, headers, boundary):
+
+def multipart_form_encode(params, headers, boundary, quote=url_quote):
+    """Creates a tuple with MultipartForm instance as body and dict as headers
+
+    params
+      dict with fields for the body
+
+    headers
+      dict with fields for the header
+
+    boundary
+      string to use as boundary
+
+    quote (default: url_quote)
+      some callable expecting a string an returning a string. Use for quoting of
+      boundary and form-data keys (names).
+    """
     headers = headers or {}
-    boundary = urllib.quote_plus(boundary)
-    body = MultipartForm(params, boundary, headers)
+    boundary = quote(boundary)
+    body = MultipartForm(params, boundary, headers, quote=quote)
     headers['Content-Type'] = "multipart/form-data; boundary=%s" % boundary
     headers['Content-Length'] = str(body.get_size())
     return body, headers

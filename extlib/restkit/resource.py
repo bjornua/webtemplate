@@ -98,7 +98,7 @@ class Resource(object):
 
         new_uri = util.make_uri(uri, path, charset=self.charset, 
                         safe=self.safe, encode_keys=self.encode_keys)
-                                                
+        
         obj = type(self)(new_uri, **self.initial['client_opts'])
         return obj
          
@@ -203,7 +203,7 @@ class Resource(object):
                                 http_code=resp.status_int, 
                                 response=resp)
                 elif resp.status_int == 410:
-                    raise ResouceGone(resp.body_string(), response=resp)
+                    raise ResourceGone(resp.body_string(), response=resp)
                 else:
                     raise RequestFailed(resp.body_string(), 
                                 http_code=resp.status_int,

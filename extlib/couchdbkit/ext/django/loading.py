@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (c) 2008-2009 Benoit Chesneau <benoitc@e-engura.com> 
+# Copyright (c) 2008-2009 Benoit Chesneau <benoitc@e-engura.com>
 #
 # Permission to use, copy, modify, and distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -16,12 +16,13 @@
 
 """
 Maintain registry of documents used in your django project
-and manage db sessions 
+and manage db sessions
 """
 
 import sys
 import os
 
+from restkit import BasicAuth
 from couchdbkit import Server
 from couchdbkit import push
 from couchdbkit.resource import CouchdbResource
@@ -39,7 +40,7 @@ class CouchdbkitHandler(object):
     __shared_state__ = dict(
             _databases = {},
             app_schema = SortedDict()
-    )    
+    )
 
     def __init__(self, databases):
         """ initialize couchdbkit handler with COUCHDB_DATABASES
@@ -47,14 +48,26 @@ class CouchdbkitHandler(object):
 
         self.__dict__ = self.__shared_state__
 
+        # Convert old style to new style
+        if isinstance(databases, (list, tuple)):
+            databases = dict(
+                (app_name, {'URL': uri}) for app_name, uri in databases
+            )
+
         # create databases sessions
-        for app_name, uri in databases:
+        for app_name, app_setting in databases.iteritems():
+            uri = app_setting['URL']
+
+            # Blank credentials are valid for the admin party
+            user = app_setting.get('USER', '')
+            password = app_setting.get('PASSWORD', '')
+            auth = BasicAuth(user, password)
 
             try:
-                if isinstance(uri, tuple):
-                    # case when you want to specify server uri 
+                if isinstance(uri, (list, tuple)):
+                    # case when you want to specify server uri
                     # and database name specifically. usefull
-                    # when you proxy couchdb on some path 
+                    # when you proxy couchdb on some path
                     server_uri, dbname = uri
                 else:
                     server_uri, dbname = uri.rsplit("/", 1)
@@ -62,13 +75,12 @@ class CouchdbkitHandler(object):
                 raise ValueError("couchdb uri [%s:%s] invalid" % (
                     app_name, uri))
 
-                
-            res = CouchdbResource(server_uri, timeout=COUCHDB_TIMEOUT)
+            res = CouchdbResource(server_uri, timeout=COUCHDB_TIMEOUT, filters=[auth])
 
             server = Server(server_uri, resource_instance=res)
             app_label = app_name.split('.')[-1]
             self._databases[app_label] = (server, dbname)
-    
+
     def sync(self, app, verbosity=2, temp=None):
         """ used to sync views of all applications and eventually create
         database.
@@ -110,7 +122,7 @@ class CouchdbkitHandler(object):
 
             if temp:
                 ddoc = db[docid]
-                view_names = ddoc['views'].keys()
+                view_names = ddoc.get('views', {}).keys()
                 if len(view_names) > 0:
                     if verbosity >= 1:
                         print 'Triggering view rebuild'
@@ -158,7 +170,7 @@ class CouchdbkitHandler(object):
             db = server.get_or_create_db(dbname)
             self._databases[app_label] = db
         return db
-                
+
     def register_schema(self, app_label, *schema):
         """ register a Document object"""
         for s in schema:
@@ -174,7 +186,7 @@ class CouchdbkitHandler(object):
     def get_schema(self, app_label, schema_name):
         """ retriev Document object from its name and app name """
         return self.app_schema.get(app_label, SortedDict()).get(schema_name.lower())
-        
+
 couchdbkit_handler = CouchdbkitHandler(COUCHDB_DATABASES)
 register_schema = couchdbkit_handler.register_schema
 get_schema = couchdbkit_handler.get_schema

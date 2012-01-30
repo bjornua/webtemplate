@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -
 #
-# This file is part of restkit released under the MIT license. 
+# This file is part of restkit released under the MIT license.
 # See the NOTICE for more information.
 
 import cgi
@@ -28,7 +28,9 @@ class Request(object):
 
         self._headers = None
         self._body = None
-        
+
+        self.is_proxied = False
+
         # set parsed uri
         self.headers = headers
         if body is not None:
@@ -52,7 +54,7 @@ class Request(object):
         parsed_url = self.parsed_url
         path = parsed_url.path or '/'
 
-        return urlparse.urlunparse(('','', path, parsed_url.params, 
+        return urlparse.urlunparse(('','', path, parsed_url.params,
             parsed_url.query, parsed_url.fragment))
     path = property(_path__get)
 
@@ -61,7 +63,7 @@ class Request(object):
             h = self.parsed_url.netloc.encode('ascii')
         except UnicodeEncodeError:
             h = self.parsed_url.netloc.encode('idna')
-        
+
         hdr_host = self.headers.iget("host")
         if not hdr_host:
             return h
@@ -74,23 +76,28 @@ class Request(object):
 
     def is_ssl(self):
         return self.parsed_url.scheme == "https"
- 
+
     def _set_body(self, body):
         ctype = self.headers.ipop('content-type', None)
         clen = self.headers.ipop('content-length', None)
-      
+
         if isinstance(body, dict):
             if ctype is not None and \
                     ctype.startswith("multipart/form-data"):
                 type_, opts = cgi.parse_header(ctype)
                 boundary = opts.get('boundary', uuid.uuid4().hex)
-                self._body, self.headers = multipart_form_encode(body, 
+                self._body, self.headers = multipart_form_encode(body,
                                             self.headers, boundary)
+                # at this point content-type is "multipart/form-data"
+                # we need to set the content type according to the
+                # correct boundary like
+                # "multipart/form-data; boundary=%s" % boundary
+                ctype = self.headers.ipop('content-type', None)
             else:
                 ctype = "application/x-www-form-urlencoded; charset=utf-8"
                 self._body = form_encode(body)
-        elif hasattr(body, "boundary"):
-            ctype = "multipart/form-data; boundary=%s" % self.body.boundary
+        elif hasattr(body, "boundary") and hasattr(body, "get_size"):
+            ctype = "multipart/form-data; boundary=%s" % body.boundary
             clen = body.get_size()
             self._body = body
         else:
@@ -100,7 +107,7 @@ class Request(object):
             ctype = 'application/octet-stream'
             if hasattr(self.body, 'name'):
                 ctype =  mimetypes.guess_type(body.name)[0]
-        
+
         if not clen:
             if hasattr(self._body, 'fileno'):
                 try:
@@ -123,6 +130,9 @@ class Request(object):
         if clen is not None:
             self.headers['Content-Length'] = clen
 
+        # TODO: maybe it's more relevant
+        # to check if Content-Type is already set in self.headers
+        # before overiding it
         if ctype is not None:
             self.headers['Content-Type'] = ctype
 
@@ -142,12 +152,12 @@ class BodyWrapper(object):
         return self
 
     def __exit__(self, exc_type, exc_val, traceback):
-        self.close() 
+        self.close()
 
     def close(self):
-        """ release connection """ 
+        """ release connection """
         self.connection.release(self.resp.should_close)
-    
+
     def __iter__(self):
         return self
 
@@ -155,7 +165,7 @@ class BodyWrapper(object):
         try:
             return self.body.next()
         except StopIteration:
-            self.close() 
+            self.close()
             raise
 
     def read(self, n=-1):
@@ -166,7 +176,7 @@ class BodyWrapper(object):
 
     def readline(self, limit=-1):
         line = self.body.readline(limit)
-        if not line: 
+        if not line:
             self.close()
         return line
 
@@ -184,8 +194,8 @@ class Response(object):
 
     def __init__(self, connection, request, resp):
         self.request = request
-        self.connection = connection 
-        
+        self.connection = connection
+
         self._resp = resp
 
         # response infos
@@ -205,8 +215,7 @@ class Response(object):
         if request.method == "HEAD":
             """ no body on HEAD, release the connection now """
             self.connection.release()
-            self._body = StringIO()
-
+            self._body = StringIO("")
         else:
             self._body = resp.body_file()
 
@@ -216,7 +225,7 @@ class Response(object):
         except AttributeError:
             pass
         return self.headers.get(key)
-    
+
     def __contains__(self, key):
         return key in self.headers
 
@@ -228,14 +237,14 @@ class Response(object):
 
     def body_string(self, charset=None, unicode_errors="strict"):
         """ return body string, by default in bytestring """
-       
-        if not self.can_read():
-            raise AlreadyRead() 
 
-        
+        if not self.can_read():
+            raise AlreadyRead()
+
+
         body = self._body.read()
         self._already_read = True
-        
+
         # release connection
         self.connection.release(self.should_close)
 
@@ -247,7 +256,7 @@ class Response(object):
         return body
 
     def body_stream(self):
-        """ stream body """ 
+        """ stream body """
         if not self.can_read():
             raise AlreadyRead()
 

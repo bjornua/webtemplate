@@ -8,33 +8,17 @@ import logging
 import os
 import time
 import socket
+import ssl
 import traceback
 import types
 import urlparse
-
-try:
-    import ssl # python 2.6
-    _ssl_wrapper = ssl.wrap_socket
-    have_ssl = True
-except ImportError:
-    if hasattr(socket, "ssl"):
-        from httplib import FakeSocket
-        from restkit.sock import trust_all_certificates
-
-        @trust_all_certificates
-        def _ssl_wrapper(sck, **kwargs):
-            ssl_sck = socket.ssl(sck, **kwargs)
-            return FakeSocket(sck, ssl_sck)
-        have_ssl = True
-    else:
-        have_ssl = False
 
 try:
     from http_parser.http import HttpStream
     from http_parser.reader import SocketReader
 except ImportError:
     raise ImportError("""http-parser isn't installed.
-        
+
         pip install http-parser""")
 
 from restkit import __version__
@@ -42,15 +26,13 @@ from restkit import __version__
 from restkit.conn import Connection
 from restkit.errors import RequestError, RequestTimeout, RedirectLimit, \
 NoMoreData, ProxyError
-from restkit.globals import get_manager
-from restkit.sock import close, send, sendfile, sendlines, send_chunk, \
-validate_ssl_args
+from restkit.session import get_session
 from restkit.util import parse_netloc, rewrite_location
 from restkit.wrappers import Request, Response
 
 MAX_CLIENT_TIMEOUT=300
 MAX_CLIENT_CONNECTIONS = 5
-MAX_CLIENT_TRIES = 5
+MAX_CLIENT_TRIES =3
 CLIENT_WAIT_TRIES = 0.3
 MAX_FOLLOW_REDIRECTS = 5
 USER_AGENT = "restkit/%s" % __version__
@@ -88,12 +70,13 @@ class Client(object):
             decompress=True,
             max_status_line_garbage=None,
             max_header_count=0,
-            manager=None,
+            session=None,
             response_class=None,
             timeout=None,
             use_proxy=False,
-            max_tries=5,
+            max_tries=3,
             wait_tries=1.0,
+            backend="thread",
             **ssl_args):
         """
         Client parameters
@@ -142,9 +125,17 @@ class Client(object):
 
 
         # set manager
-        if manager is None:
-            manager = get_manager()
-        self._manager = manager
+
+        session_options = dict(
+                retry_delay=wait_tries,
+                retry_max = max_tries,
+                timeout = timeout)
+
+
+        if session is None:
+            session = get_session(backend, **session_options)
+        self._session = session
+        self.backend = backend
 
         # change default response class
         if response_class is not None:
@@ -177,38 +168,7 @@ class Client(object):
             if hasattr(f, "on_response"):
                 self.response_filters.append(f)
 
-    def connect(self, addr, is_ssl):
-        """ create a socket """
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("create new connection")
-        for res in socket.getaddrinfo(addr[0], addr[1], 0,
-                socket.SOCK_STREAM):
-            af, socktype, proto, canonname, sa = res
 
-            try:
-                sck = socket.socket(af, socktype, proto)
-
-                if self.timeout is not None:
-                    sck.settimeout(self.timeout)
-
-                sck.connect(sa)
-
-                if is_ssl:
-                    if not have_ssl:
-                        raise ValueError("https isn't supported.  On python 2.5x,"
-                                        + " https support requires ssl module "
-                                        + "(http://pypi.python.org/pypi/ssl) "
-                                        + "to be intalled.")
-                    validate_ssl_args(self.ssl_args)
-                    sck = _ssl_wrapper(sck, **self.ssl_args)
-
-                return sck
-            except socket.error, ex:
-                if ex == 24: # too many open files
-                    raise
-                else:
-                    close(sck)
-        raise socket.error, "Can't connect to %s" % str(addr)
 
     def get_connection(self, request):
         """ get a connection from the pool or create new one. """
@@ -217,22 +177,17 @@ class Client(object):
         is_ssl = request.is_ssl()
 
         extra_headers = []
-        sck = None
+        conn = None
         if self.use_proxy:
-            sck, addr, extra_headers = self.proxy_connection(request,
+            conn = self.proxy_connection(request,
                     addr, is_ssl)
-        if not sck:
-            sck = self._manager.find_socket(addr, is_ssl)
-            if sck is None:
-                sck = self.connect(addr, is_ssl)
+        if not conn:
+            conn = self._session.get(host=addr[0], port=addr[1],
+                    pool=self._session, is_ssl=is_ssl,
+                    extra_headers=extra_headers, **self.ssl_args)
 
-        # set socket timeout in case default has changed
-        if self.timeout is not None:
-            sck.settimeout(self.timeout)
 
-        connection = Connection(sck, self._manager, addr,
-                ssl=is_ssl, extra_headers=extra_headers)
-        return connection
+        return conn
 
     def proxy_connection(self, request, req_addr, is_ssl):
         """ do the proxy connection """
@@ -240,6 +195,8 @@ class Client(object):
                 request.parsed_url.scheme)
 
         if proxy_settings and proxy_settings is not None:
+            request.is_proxied = True
+
             proxy_settings, proxy_auth =  _get_proxy_auth(proxy_settings)
             addr = parse_netloc(urlparse.urlparse(proxy_settings))
 
@@ -255,29 +212,33 @@ class Client(object):
                 proxy_pieces = '%s%s%s\r\n' % (proxy_connect, proxy_auth,
                         user_agent)
 
-                sck = self._manager.find_socket(addr, ssl)
-                if sck is None:
-                    self = self.connect(addr, ssl)
 
-                send(sck, proxy_pieces)
-                unreader = http.Unreader(sck)
-                resp = http.Request(unreader)
-                body = resp.body.read()
-                if resp.status_int != 200:
+                conn = self._session.get(host=addr[0], port=addr[1],
+                    pool=self._session, is_ssl=is_ssl,
+                    extra_headers=[], **self.ssl_args)
+
+
+                conn.send(proxy_pieces)
+                p = HttpStream(SocketReader(conn.socket()), kind=1,
+                    decompress=True)
+
+                if p.status_code != 200:
                     raise ProxyError("Tunnel connection failed: %d %s" %
                             (resp.status_int, body))
 
-                return sck, addr, []
+                _ = p.body_string()
+
             else:
                 headers = []
                 if proxy_auth:
                     headers = [('Proxy-authorization', proxy_auth)]
 
-                sck = self._manager.find_socket(addr, ssl)
-                if sck is None:
-                    sck = self.connect(addr, ssl)
-                return sck, addr, headers
-        return None, req_addr, []
+                conn = self._session.get(host=addr[0], port=addr[1],
+                        pool=self._session, is_ssl=False,
+                        extra_headers=[], **self.ssl_args)
+            return conn
+
+        return
 
     def make_headers_string(self, request, extra_headers=None):
         """ create final header string """
@@ -303,8 +264,13 @@ class Client(object):
         if not accept_encoding:
             accept_encoding = 'identity'
 
+        if request.is_proxied:
+            full_path = ("https://" if request.is_ssl() else "http://") + request.host + request.path
+        else:
+            full_path = request.path
+
         lheaders = [
-            "%s %s %s\r\n" % (request.method, request.path, httpver),
+            "%s %s %s\r\n" % (request.method, full_path, httpver),
             "Host: %s\r\n" % host,
             "User-Agent: %s\r\n" % ua,
             "Accept-Encoding: %s\r\n" % accept_encoding
@@ -324,119 +290,98 @@ class Client(object):
         if log.isEnabledFor(logging.DEBUG):
             log.debug("Start to perform request: %s %s %s" %
                     (request.host, request.method, request.path))
+        conn = None
 
-        tries = self.max_tries
-        wait = self.wait_tries
-        while tries > 0:
-            try:
-                # get or create a connection to the remote host
-                connection = self.get_connection(request)
-                sck = connection.socket()
+        try:
+            # get or create a connection to the remote host
+            conn = self.get_connection(request)
 
-                # send headers
-                msg = self.make_headers_string(request,
-                        connection.extra_headers)
+            # send headers
+            msg = self.make_headers_string(request,
+                    conn.extra_headers)
 
-                # send body
-                if request.body is not None:
-                    chunked = request.is_chunked()
-                    if request.headers.iget('content-length') is None and \
-                            not chunked:
-                        raise RequestError(
-                                "Can't determine content length and " +
-                                "Transfer-Encoding header is not chunked")
+            # send body
+            if request.body is not None:
+                chunked = request.is_chunked()
+                if request.headers.iget('content-length') is None and \
+                        not chunked:
+                    raise RequestError(
+                            "Can't determine content length and " +
+                            "Transfer-Encoding header is not chunked")
 
 
-                    # handle 100-Continue status
-                    # http://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html#sec8.2.3
-                    hdr_expect = request.headers.iget("expect")
-                    if hdr_expect is not None and \
-                            hdr_expect.lower() == "100-continue":
-                        sck.sendall(msg)
-                        msg = None
-                        resp = http.Request(http.Unreader(self._sock))
-                        if resp.status_int != 100:
-                            self.reset_request()
-                            if log.isEnabledFor(logging.DEBUG):
-                                log.debug("return response class")
-                            return self.response_class(connection,
-                                    request, resp)
-
-                    chunked = request.is_chunked()
-                    if log.isEnabledFor(logging.DEBUG):
-                        log.debug("send body (chunked: %s)" % chunked)
+                # handle 100-Continue status
+                # http://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html#sec8.2.3
+                hdr_expect = request.headers.iget("expect")
+                if hdr_expect is not None and \
+                        hdr_expect.lower() == "100-continue":
+                    conn.send(msg)
+                    msg = None
+                    p = HttpStream(SocketReader(conn.socket()), kind=1,
+                            decompress=True)
 
 
-                    if isinstance(request.body, types.StringTypes):
-                        if msg is not None:
-                            send(sck, msg + request.body, chunked)
-                        else:
-                            send(sck, request.body, chunked)
-                    else:
-                        if msg is not None:
-                            sck.sendall(msg)
+                    if p.status_code != 100:
+                        self.reset_request()
+                        if log.isEnabledFor(logging.DEBUG):
+                            log.debug("return response class")
+                        return self.response_class(conn, request, p)
 
-                        if hasattr(request.body, 'read'):
-                            if hasattr(request.body, 'seek'): request.body.seek(0)
-                            sendfile(sck, request.body, chunked)
-                        else:
-                            sendlines(sck, request.body, chunked)
-                    if chunked:
-                        send_chunk(sck, "")
-                else:
-                    sck.sendall(msg)
-
-                return self.get_response(request, connection)
-            except socket.gaierror, e:
-                try:
-                    connection.close()
-                except:
-                    pass
-
-                raise RequestError(str(e))
-            except socket.timeout, e:
-                try:
-                    connection.close()
-                except:
-                    pass
-
-                if tries <= 0:
-                    raise RequestTimeout(str(e))
-            except socket.error, e:
+                chunked = request.is_chunked()
                 if log.isEnabledFor(logging.DEBUG):
-                    log.debug("socket error: %s" % str(e))
-                try:
-                    connection.close()
-                except:
-                    pass
+                    log.debug("send body (chunked: %s)" % chunked)
 
-                if e[0] not in (errno.EAGAIN, errno.ECONNABORTED,
-                        errno.EPIPE, errno.ECONNREFUSED,
-                        errno.ECONNRESET, errno.EBADF) or tries <= 0:
-                    raise RequestError("socket.error: %s" % str(e))
-            except (KeyboardInterrupt, SystemExit):
-                break
-            except (StopIteration, NoMoreData):
-                connection.close()
-                if tries <= 0:
-                    raise
+
+                if isinstance(request.body, types.StringTypes):
+                    if msg is not None:
+                        conn.send(msg + request.body, chunked)
+                    else:
+                        conn.send(request.body, chunked)
                 else:
-                    if request.body is not None:
-                        if not hasattr(request.body, 'read') and \
-                                not isinstance(request.body, types.StringTypes):
-                            raise RequestError("connection closed and can't"
-                                    + "be resent")
-            except:
-                # unkown error
-                log.debug("unhandled exception %s" %
-                        traceback.format_exc())
+                    if msg is not None:
+                        conn.send(msg)
+
+                    if hasattr(request.body, 'read'):
+                        if hasattr(request.body, 'seek'):
+                            request.body.seek(0)
+                        conn.sendfile(request.body, chunked)
+                    else:
+                        conn.sendlines(request.body, chunked)
+                if chunked:
+                    conn.send_chunk("")
+            else:
+                conn.send(msg)
+
+            return self.get_response(request, conn)
+        except socket.gaierror, e:
+            if conn is not None:
+                conn.close()
+            raise RequestError(str(e))
+        except socket.timeout, e:
+            if conn is not None:
+                conn.close()
+            raise RequestTimeout(str(e))
+        except socket.error, e:
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("socket error: %s" % str(e))
+            if conn is not None:
+                conn.close()
+            raise RequestError("socket.error: %s" % str(e))
+        except (StopIteration, NoMoreData):
+            if conn is not None:
+                conn.close()
+            if request.body is not None:
+                if not hasattr(request.body, 'read') and \
+                        not isinstance(request.body, types.StringTypes):
+                    raise RequestError("connection closed and can't"
+                            + "be resent")
+            else:
                 raise
-
-            # time until we retry.
-            time.sleep(wait)
-            wait = wait * 2
-            tries = tries - 1
-
+        except Exception:
+            # unkown error
+            log.debug("unhandled exception %s" %
+                    traceback.format_exc())
+            raise
 
     def request(self, url, method='GET', body=None, headers=None):
         """ perform immediatly a new request """
@@ -457,7 +402,7 @@ class Client(object):
         self._nb_redirections = self.max_follow_redirect
         return self.perform(request)
 
-    def redirect(self, resp, location, request):
+    def redirect(self, location, request):
         """ reset request, set new url of request and perform it """
         if self._nb_redirections <= 0:
             raise RedirectLimit("Redirection limit is reached")
@@ -485,7 +430,7 @@ class Client(object):
         if log.isEnabledFor(logging.DEBUG):
             log.debug("Start to parse response")
 
-        p = HttpStream(SocketReader(connection.socket()), kind=1, 
+        p = HttpStream(SocketReader(connection.socket()), kind=1,
                 decompress=self.decompress)
 
         if log.isEnabledFor(logging.DEBUG):
@@ -493,27 +438,26 @@ class Client(object):
             log.debug("headers: [%s]" % p.headers())
 
         location = p.headers().get('location')
-        
+
         if self.follow_redirect:
             if p.status_code() in (301, 302, 307,):
+                connection.close()
                 if request.method in ('GET', 'HEAD',) or \
                         self.force_follow_redirect:
                     if hasattr(self.body, 'read'):
                         try:
                             self.body.seek(0)
                         except AttributeError:
-                            connection.release()
                             raise RequestError("Can't redirect %s to %s "
                                     "because body has already been read"
                                     % (self.url, location))
-                    connection.release()
-                    return self.redirect(p, location, request)
+                    return self.redirect(location, request)
 
             elif p.status_code() == 303 and self.method == "POST":
-                connection.release()
+                connection.close()
                 request.method = "GET"
                 request.body = None
-                return self.redirect(p, location, request)
+                return self.redirect(location, request)
 
         # create response object
         resp = self.response_class(connection, request, p)
